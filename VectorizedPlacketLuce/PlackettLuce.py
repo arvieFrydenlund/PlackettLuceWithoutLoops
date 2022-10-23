@@ -158,6 +158,7 @@ class PlackettLuceLoss(nn.Module):
         # need small num for numerical stability, else -inf
         # note this will make it different from the loop method
         # these are only needed for the lower ranks, so we can use smaller eta to make the top ranks the same
+        # this is modification after the paper, don't know if it will work in practice TODO
         eta_range = torch.arange(0, max_k, device=logits.device).float()
         eta_range *= (eta / max_k)
 

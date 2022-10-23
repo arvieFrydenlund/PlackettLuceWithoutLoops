@@ -26,8 +26,8 @@ class RankModel(nn.Module):
 
     def forward(self, inputs):
         """
-        :param inputs: [bs, max_k < dim]
-        :return:
+        :param inputs: [bs, max_k < num_class]
+        :return: [bs, max_k] logits which score each input
         """
         return self.score(nn.functional.tanh(self.embeddings(inputs))).squeeze(dim=-1)
 
@@ -50,7 +50,7 @@ class RankModel(nn.Module):
 
 def train():
     num_class = 19
-    max_k = 11
+    max_k = 11  # number of rank targets
     dim = 64
     bs = 10
 
@@ -67,7 +67,6 @@ def train():
         # print(targets[:1, :])
         # print(logits[:1, :])
 
-        # cut off here is because algorithm is not tested for full ranks
         loop_pl_avg_loss, loop_pl_full_loss, _ = pl.loop_forward(logits, pl_targets=targets)
 
         pl_avg_loss, pl_full_loss, _ = pl(logits, pl_targets=targets)
@@ -76,7 +75,7 @@ def train():
         print(pl_full_loss[:1, :])
 
         ce_loss = nn.functional.cross_entropy(logits, targets[..., 0])
-        #ce_loss.backward()
+        # ce_loss.backward()
 
         pl_avg_loss.backward()
         optimizer.step()
