@@ -6,12 +6,23 @@ from torch import nn as nn
 
 
 class PlackettLuceLoss(nn.Module):
+    """
+    Partial Plackett-Luce
+    """
     def __init__(self):
         super(PlackettLuceLoss, self).__init__()
         self.ninf = -np.inf
 
     @staticmethod
-    def _avg(loss, target_lengths=None, num=None):
+    def avg(loss, target_lengths=None, num=None, reduce='none'):
+        """
+        :param loss: [d1...dn-1, max_k]
+        :param target_lengths:
+        :param num:
+        :return: pl_avg_loss, [1],
+                 pl_loss, [d1...dn-1], summed across the ranks
+                 [1], number of values
+        """
         if num is not None:
             avg_loss = loss.sum() / num
         elif target_lengths is not None:
@@ -20,7 +31,8 @@ class PlackettLuceLoss(nn.Module):
         else:
             num = torch.ones([1]) * loss.nelement()
             avg_loss = loss.mean()
-        loss = torch.sum(loss, dim=-1)  # [-1]
+        if reduce == 'ranks':
+            loss = torch.sum(loss, dim=-1)  # [-1]
         return avg_loss, loss, num
 
     @staticmethod
@@ -32,17 +44,22 @@ class PlackettLuceLoss(nn.Module):
         return bool(torch.isnan(t).any())
 
     @staticmethod
-    def _bad_check(t):
-        return PlackettLuceLoss._is_inf_check(t) or PlackettLuceLoss._nan_check(t)
+    def bad_loss_check(t):
+        is_inf = PlackettLuceLoss._is_inf_check(t)
+        is_nan = PlackettLuceLoss._nan_check(t)
+        if is_inf or is_nan:
+            raise ValueError(f'Bad loss: is inf {is_inf}, is nan {is_nan}, check numerical stability value.')
 
-    def loop_forward(self, logits, pl_targets):
+    def loop_forward(self, logits, pl_targets, reduce='none'):
         """
-        For comparison with vectorized version
+        Wasteful version that needs to loop over the ranks and recompute the normalization term each iteration.
+        For comparison with vectorized version.
+        Note, that the most preferred rank will be equal to regular cross-entropy softmax.
         :param logits: [d1...dn-1, vocab_size], float32
         :param pl_targets: [d1...dn-1, max_k], ranked order indices, int64
-        :return:
+        :return:  [d1...dn-1, max_k]
         """
-        masked_logits = logits.clone()
+        masked_logits = logits.clone()  # we can't modify the actual logits otherwise backwards doesn't make sense.
         pl_full_loss = []
         ninf = torch.ones_like(logits) * self.ninf
         for k in range(pl_targets.shape[-1] - 1):
@@ -50,36 +67,43 @@ class PlackettLuceLoss(nn.Module):
             masked_logits.scatter_(dim=-1, index=pl_targets[..., k].unsqueeze(dim=-1), src=ninf)
         pl_full_loss.append(torch.nn.functional.cross_entropy(masked_logits, pl_targets[..., -1], reduction='none'))
         pl_full_loss = torch.stack(pl_full_loss, dim=-1)
-        pl_avg_loss, pl_loss, pl_num = self._avg(pl_full_loss)
-        return pl_avg_loss, pl_loss, pl_num,  pl_full_loss
+        return self.avg(pl_full_loss, reduce=reduce)
 
-    def forward(self, logits, pl_targets, target_lengths=None, target_values=None, orders=None, **kwargs):
+    def forward(self, logits, pl_targets, target_lengths=None, target_values=None, orders=None,
+                reduce='none', **kwargs):
         """
-        :param logits:  [d1...dn-1, vocab_size], float32
+        Note the eta term will make it different from the loop version when the cost becomes very low.
+        This will then up weight the lowest ranks, so be careful if you see the loss increasing.
+        Otherwise, set eta to zero and do nan check when cost becomes low.
+
+        :param logits:  [d1...dn-1, vocab_size], float32, class scores
         :param pl_targets: [d1...dn-1, max_k], ranked order indices, int64
         :param target_lengths: [d1...dn-1], the dynamic size of k, int64 or None
         :param target_values: [d1...dn-1, max_k], weights, float32
-        :param orders: [d1...dn-1, max_k], weights, int64
-        :return: [1], [d1...dn-1, max_k], [1]
+                              Currently we assume that these are normalized to 1 over the ranks.  TODO
+        :param orders: [d1...dn-1, max_k], int64, in range (0, max_k) or None
+                        these are indices to the orders 'head' i.e. the first element of the order
+                        so for example, [0, 1, 1, 3, 3, 5, 5, 5, 5, 9]
+                        means the gt is 0, then we have an order of two words, with the head at index 1,
+                        then an order of 2 things with the head at 3, then an order of four things with the head at 5.
+        :param reduce: str, ('none', 'rank')
+        :return: pl_avg_loss, [1],
+                 pl_loss, [d1...dn-1], summed across the ranks if reduce = 'ranks'
+                          [d1...dn-1, max_k], if reduce = 'none'
+                 num [1], number of values (possibly weighted by target_values)
         """
 
         pl_full_loss, mask = self._forward(logits, pl_targets, target_lengths, orders=orders)
-        if target_values is not None:
+        if target_values is not None:  # weight loss by target values
             pl_full_loss *= target_values.view(-1, target_values.shape[-1])
 
-        if self._nan_check(pl_full_loss) or self._is_inf_check(pl_full_loss):
-            raise ValueError('NAN in no_ce_forward')
-
         if target_values is not None:  # assume normalized target values
-            pl_avg_loss, pl_loss, pl_num = self._avg(pl_full_loss, mask, num=mask.shape[0])
+            return self.avg(pl_full_loss, mask, num=mask.shape[0], reduce=reduce)
         else:
-            pl_avg_loss, pl_loss, pl_num = self._avg(pl_full_loss, mask)
-
-        return pl_avg_loss, pl_loss, pl_num, pl_full_loss
-
+            return self.avg(pl_full_loss, mask,  reduce=reduce)
 
     @staticmethod
-    def _forward(logits, pl_targets, target_lengths=None, orders=None, **kwargs):
+    def _forward(logits, pl_targets, target_lengths=None, orders=None, eta=0.000001, **kwargs):
         """
         Note that we need to calculate the logits and normalization term, Z, only once, then modify Z
         and renormalize at every instance of the 'loop':
@@ -97,7 +121,8 @@ class PlackettLuceLoss(nn.Module):
                         so for example, [0, 1, 1, 3, 3, 5, 5, 5, 5, 9]
                         means the gt is 0, then we have an order of two words, with the head at index 1,
                         then an order of 2 things with the head at 3, then an order of four things with the head at 5.
-        :return: [d1...dn-1, max_k]
+        :param eta: small float for numerical stability
+        :return: [d1...dn-1, max_k], [d1...dn-1, max_k] or None
         """
 
         max_k = pl_targets.shape[-1]  # max_k needs to be >= 2, otherwise just use cross entropy
@@ -131,9 +156,16 @@ class PlackettLuceLoss(nn.Module):
             Z_mod = torch.gather(Z_mod, dim=-1, index=orders)
 
         # need small num for numerical stability, else -inf
-        # note this will make it different from forward method
-        Z = torch.log(Z - Z_mod + 0.000001) + m  # [-1 max_k], log renormed Z + log-sum-exp trick
+        # note this will make it different from the loop method
+        # these are only needed for the lower ranks, so we can use smaller eta to make the top ranks the same
+        eta_range = torch.arange(0, max_k, device=logits.device).float()
+        eta_range *= (eta / max_k)
+
+        Z = torch.log(Z - Z_mod + eta_range) + m  # [-1 max_k], log renormed Z + log-sum-exp trick
         loss = Z - logits_gather  # [-1 max_k]
+
+        if max_k == logits.shape[-1]:  # fix for full rankings, should be a better way of doing this
+            loss.scatter_(-1, index=torch.ones_like(pl_targets)*(max_k-1), src=torch.zeros_like(loss))
 
         mask = None
         if target_lengths is not None:
@@ -141,17 +173,6 @@ class PlackettLuceLoss(nn.Module):
                     < target_lengths[:, None].int()).float()
 
             fill_mask = mask <= 0.0
-            # fill_mask |= self._bad_mask(torch.log(Z - Z_mod))
             loss.masked_fill_(fill_mask, 0.0)
         return loss, mask
-
-    def to_str(self, loss, num, ce_loss, ce_num, *args, **kwargs):
-        pl_avg_loss = float(loss / num)
-        ce_avg_loss = float(ce_loss / ce_num)
-        ppl = math.exp(ce_avg_loss)
-        bpc = ce_avg_loss / math.log(2)
-
-        s = 'PL loss {:5.4f} | '.format(pl_avg_loss)
-        s += 'CE loss {:5.4f} | ppl {:8.4f} | bpc {:8.4f} | '.format(ce_avg_loss, ppl, bpc)
-        return s, pl_avg_loss, ce_avg_loss, ppl, bpc
 
