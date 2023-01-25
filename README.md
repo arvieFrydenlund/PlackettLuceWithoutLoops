@@ -1,4 +1,4 @@
-A GPU effiecent vectorized Plackett-Luce loss in PyTorch from [Language Modelling via Learning to Rank, Frydenlund et al. AAAI22.](https://arxiv.org/abs/2110.06961)
+A GPU efficient vectorized Plackett-Luce loss in PyTorch from [Language Modelling via Learning to Rank, Frydenlund et al. AAAI22.](https://arxiv.org/abs/2110.06961)
 
 1) This is tested for partial Plackett-Luce (k known ranks of v total classes), it is untested for full rankings.
 2) This includes the biased partitioned preference modification, which treats all items in a partition (order) as equally preferred.
